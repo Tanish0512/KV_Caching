@@ -42,15 +42,15 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         self.flash = False
+        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, past_kv = False):
+    def forward(self, x, past_kv = None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -110,10 +110,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, past_kv = None):
+        attn_output, present_kv = self.attn(self.ln_1(x), past_kv)
+        x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present_kv
 
 @dataclass
 class GPTConfig:
@@ -177,30 +178,50 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kvs=None): # Added past_kvs
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        _, t = idx.size()
+        
+        # If we have a cache, 't' is usually 1, but 'pos' needs the absolute position
+        # We calculate the start position based on how many tokens are already in the cache
+        past_length = 0
+        if past_kvs is not None:
+            # past_kvs[0][0] is the 'k' tensor of the first layer: shape (b, nh, past_t, hs)
+            past_length = past_kvs[0][0].size(-2) 
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        assert t + past_length <= self.config.block_size, f"Total sequence {t + past_length} exceeds block size"
+        
+        # Absolute positions for position embeddings
+        pos = torch.arange(past_length, t + past_length, dtype=torch.long, device=device)
+
+        # Embeddings
+        tok_emb = self.transformer.wte(idx) 
+        pos_emb = self.transformer.wpe(pos) 
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        # --- THE FIXED LOOP ---
+        new_kvs = []
+        for i, block in enumerate(self.transformer.h):
+            # Get the specific cache for this layer if it exists
+            past_kv = past_kvs[i] if past_kvs is not None else None
+            
+            # Block now returns (Tensor, Tuple)
+            x, present_kv = block(x, past_kv=past_kv)
+            
+            new_kvs.append(present_kv)
+        # -----------------------
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) 
             loss = None
 
-        return logits, loss
+        # Return the new_kvs so the generate loop can feed them back in
+        return logits, new_kvs if targets is None else loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
