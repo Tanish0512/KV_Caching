@@ -50,38 +50,38 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-def forward(self, x, past_kv=None):
-    B, T, C = x.size()
-    q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+    def forward(self, x, past_kv=None):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # Reshape to (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
     
-    # Reshape to (B, nh, T, hs)
-    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-    if past_kv is not None:
-        past_k, past_v = past_kv
-        k = torch.cat((past_k, k), dim=2) # Concatenate along Time dimension
-        v = torch.cat((past_v, v), dim=2)
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=2) # Concatenate along Time dimension
+            v = torch.cat((past_v, v), dim=2)
+        
+        present_kv = (k, v)
+        T_total = k.size(-2)
     
-    present_kv = (k, v)
-    T_total = k.size(-2)
-
-    # Manual implementation
-    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # Manual implementation
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        
+        # ONLY apply mask if we are processing more than one token (the prompt phase)
+        if T > 1:
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # If T=1, no mask is needed because we can't see the future anyway!
     
-    # ONLY apply mask if we are processing more than one token (the prompt phase)
-    if T > 1:
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-    # If T=1, no mask is needed because we can't see the future anyway!
-
-    att = F.softmax(att, dim=-1)
-    att = self.attn_dropout(att)
-    y = att @ v
-    
-    y = y.transpose(1, 2).contiguous().view(B, T, C)
-    y = self.resid_dropout(self.c_proj(y))
-    return y, present_kv
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y, present_kv
 
 class MLP(nn.Module):
 
