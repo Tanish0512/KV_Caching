@@ -348,7 +348,7 @@ class GPT(nn.Module):
             else:
                 idx_cond = idx[:, -1:]
             # forward the model to get the logits for the index in the sequence
-            logits, past_kv = self(idx_cond, past_kv)
+            logits, past_kv = self(idx_cond, past_kv = past_kv)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
